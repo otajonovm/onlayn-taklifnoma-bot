@@ -18,6 +18,7 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "templates").strip()
 
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
+USERBOT_SESSION = os.getenv("USERBOT_SESSION", "").strip()
 USERBOT_REPLY_TO_CONTACTS = os.getenv("USERBOT_REPLY_TO_CONTACTS", "false").lower() == "true"
 TAKEOVER_MINUTES = int(os.getenv("TAKEOVER_MINUTES", "60") or 60)
 

@@ -9,11 +9,12 @@ import time
 from collections import defaultdict
 
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.types import User
 
 import agent
 import store
-from config import API_HASH, API_ID, GEMINI_API_KEY, TAKEOVER_MINUTES, USERBOT_REPLY_TO_CONTACTS
+from config import API_HASH, API_ID, GEMINI_API_KEY, TAKEOVER_MINUTES, USERBOT_REPLY_TO_CONTACTS, USERBOT_SESSION
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("userbot")
@@ -26,7 +27,8 @@ if not GEMINI_API_KEY:
 DEBOUNCE_SECONDS = 3
 SEND_GAP_SECONDS = 1.0
 
-client = TelegramClient("masudbek", API_ID, API_HASH)
+session = StringSession(USERBOT_SESSION) if USERBOT_SESSION else "masudbek"
+client = TelegramClient(session, API_ID, API_HASH)
 
 sent_by_ai: set[tuple[int, int]] = set()
 paused_until: dict[int, float] = {}
