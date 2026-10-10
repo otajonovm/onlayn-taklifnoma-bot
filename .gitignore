@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+drafts.json
+orders.json
+.idea/
+.vscode/
