@@ -33,7 +33,7 @@ SHOW_TEMPLATES_TOOL = types.FunctionDeclaration(
         "properties": {
             "format": {
                 "type": "string",
-                "description": "video, sayt yoki rasm. Noma'lum bo'lsa bo'sh qoldir",
+                "description": "Mijoz so'ragan format: video, sayt yoki rasm. Formatni aniq yoz",
             },
         },
         "required": [],
@@ -55,6 +55,7 @@ class Reply:
     show_templates: bool = False
     template_kind: str | None = None
     payment_shown: bool = False
+    tokens: int = 0
 
 
 def _append(key: str, role: str, text: str) -> None:
@@ -88,12 +89,34 @@ def transcript(key: str, last: int = 12) -> str:
     return "\n".join(f"{ROLE_LABELS[r]}: {t}" for r, t in histories[key][-last:])
 
 
+DEADLINE_RE = re.compile(
+    r"(soat|minut).{0,40}(tayyor|tashlab|qilib ber|qiber|beramiz|beraman)"
+    r"|(tayyor|tashlab|qilib ber|qiber).{0,40}(soat|minut)",
+    re.IGNORECASE,
+)
+DEADLINE_LINE = "Uzog'i bilan 1 kunda tayyor bo'ladi"
+
+
+def _usage_tokens(response) -> int:
+    meta = getattr(response, "usage_metadata", None)
+    if not meta:
+        return 0
+    total = getattr(meta, "total_token_count", None)
+    if total:
+        return int(total)
+    prompt = int(getattr(meta, "prompt_token_count", 0) or 0)
+    output = int(getattr(meta, "candidates_token_count", 0) or 0)
+    return prompt + output
+
+
 def split_messages(text: str) -> list[str]:
     out = []
     for line in text.splitlines():
         line = EMOJI_RE.sub("", line).strip().strip("-•*").strip()
         line = line.rstrip(".").strip()
-        if line:
+        if DEADLINE_RE.search(line):
+            line = DEADLINE_LINE
+        if line and line not in out:
             out.append(line)
     return out[:4]
 
@@ -130,12 +153,19 @@ def _ask_sync(key: str, text: str, name: str | None) -> Reply:
         awaiting_receipt[key] = True
 
     _append(key, "assistant", joined)
+    reply.tokens = _usage_tokens(response)
     return reply
 
 
 async def ask(key: str, text: str, name: str | None = None) -> Reply:
     try:
-        return await asyncio.to_thread(_ask_sync, key, text, name)
+        reply = await asyncio.to_thread(_ask_sync, key, text, name)
     except Exception:
         logger.exception("Gemini xatosi")
-        return Reply(messages=FALLBACK)
+        reply = Reply(messages=FALLBACK)
+    chat_id = store.telegram_id_from_key(key)
+    if chat_id:
+        await store.remember_client(chat_id)
+        if reply.tokens:
+            await store.add_tokens(reply.tokens)
+    return reply

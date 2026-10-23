@@ -4,6 +4,7 @@ Birinchi ishga tushirishda telefon raqam va Telegram kodini so'raydi,
 keyin `masudbek.session` faylida saqlab qoladi.
 """
 import asyncio
+import io
 import logging
 import time
 from collections import defaultdict
@@ -14,7 +15,7 @@ from telethon.tl.types import User
 
 import agent
 import store
-from config import API_HASH, API_ID, GEMINI_API_KEY, TAKEOVER_MINUTES, USERBOT_REPLY_TO_CONTACTS, USERBOT_SESSION
+from config import API_HASH, API_ID, GEMINI_API_KEY, TAKEOVER_MINUTES, USERBOT_SESSION
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("userbot")
@@ -46,9 +47,14 @@ def _is_paused(chat_id: int) -> bool:
     return paused_until.get(chat_id, 0) > time.time()
 
 
-async def send(chat_id: int, text: str = "", file: str | None = None):
+async def send(chat_id: int, text: str = "", file=None, *, video: bool = False):
     if file:
-        msg = await client.send_file(chat_id, file, caption=text or None)
+        msg = await client.send_file(
+            chat_id,
+            file,
+            caption=text or None,
+            supports_streaming=video,
+        )
     else:
         msg = await client.send_message(chat_id, text)
     sent_by_ai.add((chat_id, msg.id))
@@ -63,24 +69,37 @@ async def notify_me(text: str) -> None:
 
 
 async def send_templates(chat_id: int, kind: str | None) -> None:
+    if not kind:
+        return
     try:
         items = await store.list_templates_for(kind)
     except Exception:
         logger.exception("Shablonlarni olishda xato")
         items = []
     if not items:
+        label = store.KIND_LABELS.get(kind, kind)
         await send(chat_id, "Hozir aniqlab aytaman aka")
-        await notify_me(f"⚠️ Mijoz {chat_id} shablon so'radi, bazada shablon yo'q")
+        await notify_me(f"⚠️ Mijoz {chat_id} {label} namuna so'radi, bazada bu format yo'q")
         return
 
     items = items[:10]
     for i, item in enumerate(items, 1):
-        caption = store.caption(item, i)
+        spec = store.delivery(item, i)
         try:
-            await send(chat_id, caption, file=item.get("media_url"))
+            if spec["mode"] == "video" and spec["file"]:
+                data, filename = await store.download_media(spec["file"])
+                buf = io.BytesIO(data)
+                buf.name = filename
+                await send(chat_id, spec["text"], file=buf, video=True)
+            elif spec["mode"] == "photo" and spec["file"]:
+                await send(chat_id, spec["text"], file=spec["file"])
+            else:
+                await send(chat_id, spec["text"])
         except Exception:
             logger.exception("Shablon media yuborilmadi: %s", item.get("id"))
-            await send(chat_id, caption)
+            await send(chat_id, spec["text"])
+            if spec["mode"] == "video":
+                await notify_me(f"⚠️ Video fayl yuborilmadi: #{item.get('id')} {item.get('title')}")
         await asyncio.sleep(0.5)
 
     agent.add_event(_key(chat_id), store.summary(items))
@@ -127,12 +146,13 @@ async def on_incoming(event: events.NewMessage.Event) -> None:
     sender = await event.get_sender()
     if not isinstance(sender, User) or sender.bot or sender.is_self:
         return
-    if sender.contact and not USERBOT_REPLY_TO_CONTACTS:
-        return
+    logger.info("Xabar keldi: %s id=%s contact=%s", sender.first_name, sender.id, sender.contact)
     if await store.is_staff(sender.id):
+        logger.info("Admin, javob berilmaydi: %s", sender.id)
         return
     chat_id = event.chat_id
     key = _key(chat_id)
+    await store.remember_client(sender.id)
 
     if _is_paused(chat_id):
         agent.add_user(key, event.raw_text or "[media]")
@@ -142,6 +162,7 @@ async def on_incoming(event: events.NewMessage.Event) -> None:
         if agent.awaiting_receipt.get(key):
             agent.awaiting_receipt[key] = False
             agent.add_event(key, "Mijoz chek yubordi")
+            await store.mark_paid(sender.id)
             await send(chat_id, "Chekni oldim hozir ko'rib chiqamiz")
             await notify_me(f"🧾 Mijoz {chat_id} chek yubordi")
             await event.forward_to("me")

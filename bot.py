@@ -5,7 +5,7 @@ from html import escape
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import agent
 import store
@@ -27,9 +27,9 @@ dp = Dispatcher()
 is_admin = F.from_user.id == int(ADMIN_ID) if ADMIN_ID else F.from_user.id == -1
 wizards: dict[int, dict] = {}
 WIZARD_PROMPTS = {
-    "title": "Shablon nomi?",
-    "demo": "Demo havola (https://...)",
-    "media": "Media: rasm/video yuboring yoki https havola. Bekor: /cancel",
+    "title": "Namuna nomi?",
+    "demo": "Veb-sayt havolasi (https://...). Bekor: /cancel",
+    "media": "Videoni fayl qilib yuboring. Havola emas. Bekor: /cancel",
     "admin_id": "Telegram ID yuboring. Bekor: /cancel",
 }
 CATEGORY_BUTTONS = (
@@ -45,10 +45,45 @@ def _key(user_id: int) -> str:
     return f"b{user_id}"
 
 
+def format_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Video", callback_data="adm:kind:video")],
+        [InlineKeyboardButton(text="Veb-sayt", callback_data="adm:kind:sayt")],
+        [InlineKeyboardButton(text="Bekor", callback_data="adm:menu")],
+    ])
+
+
+def _pretty(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
+async def send_stats(message: Message, user_id: int) -> None:
+    try:
+        data = await store.stats()
+    except Exception as exc:
+        logger.exception("Statistika olinmadi")
+        await message.answer(
+            f"Statistika olinmadi: {exc}\nAvval supabase_setup.sql ni qayta Run qiling",
+            reply_markup=admin_menu_kb(user_id),
+        )
+        return
+    await message.answer(
+        "Statistika\n\n"
+        f"Klientlar: {_pretty(data['clients'])}\n"
+        "Bot gaplashgan odamlar soni\n\n"
+        f"Token: {_pretty(data['tokens'])}\n"
+        "Javob yozishda sarflangan token\n\n"
+        f"Pullik ishlar: {_pretty(data['paid'])}\n"
+        "Chek yuborib, to'lovi tushgan ishlar",
+        reply_markup=admin_menu_kb(user_id),
+    )
+
+
 def admin_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="Shablon qo'shish", callback_data="adm:add")],
-        [InlineKeyboardButton(text="Shablonlar", callback_data="adm:list")],
+        [InlineKeyboardButton(text="Statistika", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="Namuna qo'shish", callback_data="adm:add")],
+        [InlineKeyboardButton(text="Namunalar", callback_data="adm:list")],
         [InlineKeyboardButton(text="Yoqish / o'chirish", callback_data="adm:toggles")],
     ]
     if store.is_superadmin(user_id):
@@ -78,7 +113,34 @@ async def send_lines(message: Message, lines: list[str]) -> None:
         await message.answer(line)
 
 
+async def send_one_template(message: Message, item: dict, index: int) -> None:
+    spec = store.delivery(item, index)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Shuni tanlayman", callback_data=f"tpl:{item['id']}")]]
+    )
+    try:
+        if spec["mode"] == "video" and spec["file"]:
+            await bot.send_chat_action(message.chat.id, action="upload_video")
+            data, filename = await store.download_media(spec["file"])
+            await message.answer_video(
+                BufferedInputFile(data, filename=filename),
+                caption=spec["text"],
+                reply_markup=kb,
+            )
+            return
+        if spec["mode"] == "photo" and spec["file"]:
+            await message.answer_photo(spec["file"], caption=spec["text"], reply_markup=kb)
+            return
+    except Exception:
+        logger.exception("Shablon yuborilmadi: %s", item.get("id"))
+        if spec["mode"] == "video":
+            await notify_admin(message.chat.id, f"Video fayl yuborilmadi: #{item.get('id')} {item.get('title')}")
+    await message.answer(spec["text"], reply_markup=kb)
+
+
 async def send_templates(message: Message, kind: str | None) -> None:
+    if not kind:
+        return
     key = _key(message.chat.id)
     try:
         items = await store.list_templates_for(kind)
@@ -86,27 +148,16 @@ async def send_templates(message: Message, kind: str | None) -> None:
         logger.exception("Shablonlarni olishda xato")
         items = []
     if not items:
+        label = store.KIND_LABELS.get(kind, kind)
         await message.answer("Hozir aniqlab aytaman aka")
-        await notify_admin(message.chat.id, "Mijoz shablon so'radi, lekin bazada shablon yo'q")
+        await notify_admin(message.chat.id, f"Mijoz {label} namuna so'radi, bazada bu format yo'q")
         return
 
-    for i, item in enumerate(items[:10], 1):
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="Shuni tanlayman", callback_data=f"tpl:{item['id']}")]]
-        )
-        text = store.caption(item, i)
-        try:
-            if item.get("media_url") and item.get("media_type") == "video":
-                await message.answer_video(item["media_url"], caption=text, reply_markup=kb)
-            elif item.get("media_url"):
-                await message.answer_photo(item["media_url"], caption=text, reply_markup=kb)
-            else:
-                await message.answer(text, reply_markup=kb)
-        except Exception:
-            logger.exception("Shablon yuborilmadi: %s", item.get("id"))
-            await message.answer(text, reply_markup=kb)
+    items = items[:10]
+    for i, item in enumerate(items, 1):
+        await send_one_template(message, item, i)
 
-    agent.add_event(key, store.summary(items[:10]))
+    agent.add_event(key, store.summary(items))
     await message.answer("Tanlang hohlagan shablonizni")
 
 
@@ -142,8 +193,9 @@ async def start_handler(message: Message) -> None:
         await show_admin_menu(message, message.from_user.id)
         return
     key = _key(message.from_user.id)
+    await store.remember_client(message.from_user.id)
     agent.reset(key)
-    lines = ["Assalomu alaykum", "Nima xizmat"]
+    lines = ["Assalomu alaykum"]
     agent.add_assistant(key, "\n".join(lines))
     await send_lines(message, lines)
 
@@ -156,15 +208,18 @@ async def deny_unless_staff(message: Message) -> bool:
 
 
 def _saved_template_text(item: dict) -> str:
-    demo = item.get("demo_url") or item.get("url") or "—"
-    media = item.get("video_url") or item.get("preview_url") or item.get("media_url") or "—"
+    kind = store.KIND_LABELS.get(item.get("kind"), item.get("kind") or "—")
+    if item.get("kind") == "video":
+        extra = "Video: fayl saqlandi"
+    else:
+        extra = "Havola: " + (item.get("demo_url") or item.get("url") or "—")
     return (
-        "✅ Shablon saqlandi\n"
+        "✅ Namuna saqlandi\n"
         f"ID: {item['id']}\n"
         f"Nomi: {item['title']}\n"
+        f"Format: {kind}\n"
         f"Kategoriya: {item.get('category') or '—'}\n"
-        f"Demo: {demo}\n"
-        f"Media: {media}"
+        f"{extra}"
     )
 
 
@@ -224,8 +279,8 @@ async def add_template_cmd(message: Message, command: CommandObject) -> None:
     if await deny_unless_staff(message):
         return
     if not (command.args or "").strip():
-        wizards[message.from_user.id] = {"step": "title", "data": {}, "mode": "template"}
-        await message.answer(WIZARD_PROMPTS["title"])
+        wizards[message.from_user.id] = {"step": "kind", "data": {}, "mode": "template"}
+        await message.answer("Namuna qanday bo'ladi?", reply_markup=format_kb())
         return
     parsed = store.parse_catalog_line(command.args)
     if isinstance(parsed, str):
@@ -248,6 +303,9 @@ async def wizard_step(message: Message) -> None:
     state = wizards[message.from_user.id]
     value = message.text.strip()
     step = state["step"]
+    if step == "kind":
+        await message.answer("Formatni tugmadan tanlang", reply_markup=format_kb())
+        return
     if step == "category":
         await message.answer("Kategoriyani tugmadan tanlang", reply_markup=category_kb())
         return
@@ -272,29 +330,24 @@ async def wizard_step(message: Message) -> None:
         await message.answer(text, reply_markup=admin_menu_kb(message.from_user.id))
         return
     if step == "demo" and not value.startswith(("http://", "https://")):
-        await message.answer("Demo havola https:// bilan boshlanishi kerak")
+        await message.answer("Veb-sayt havolasi https:// bilan boshlanishi kerak")
         return
-    if step == "media" and not value.startswith(("http://", "https://")):
-        await message.answer("Media uchun https havola yozing yoki rasm/video yuboring")
+    if step == "media":
+        await message.answer("Videoni fayl qilib yuboring. Havola qabul qilinmaydi")
         return
     state["data"][step] = value
-    nxt = {"title": "category", "demo": "media"}.get(step)
-    if nxt:
-        state["step"] = nxt
-        if nxt == "category":
-            await message.answer("Kategoriyani tanlang", reply_markup=category_kb())
-        else:
-            await message.answer(WIZARD_PROMPTS[nxt])
+    if step == "title":
+        state["step"] = "category"
+        await message.answer("Kategoriyani tanlang", reply_markup=category_kb())
+        return
+    if step == "demo" and state["data"].get("kind") != "sayt":
+        state["step"] = "media"
+        await message.answer(WIZARD_PROMPTS["media"])
         return
     wizards.pop(message.from_user.id, None)
     data = state["data"]
-    parsed = store.parse_catalog_line(
-        f"{data['title']} | {data['category']} | {data['demo']} | {data['media']}"
-    )
-    if isinstance(parsed, str):
-        await message.answer(parsed)
-        return
-    await save_catalog(message, parsed)
+    media_url = data.get("media")
+    await save_catalog(message, store.sample_payload(data, media_url, "video" if media_url else None))
     await message.answer("Menyu", reply_markup=admin_menu_kb(message.from_user.id))
 
 
@@ -302,6 +355,11 @@ async def save_wizard_file(message: Message) -> None:
     state = wizards.get(message.from_user.id)
     if not state or state.get("step") != "media":
         await show_admin_menu(message, message.from_user.id)
+        return
+    if state["data"].get("kind") == "video" and not (
+        message.video or (message.document and (message.document.mime_type or "").startswith("video"))
+    ):
+        await message.answer("Video namuna uchun video fayl yuboring. Havola emas")
         return
     if message.photo:
         file_id, mime, filename, media_type = message.photo[-1].file_id, "image/jpeg", "preview.jpg", "photo"
@@ -316,30 +374,20 @@ async def save_wizard_file(message: Message) -> None:
         filename = message.document.file_name or "file"
         media_type = "video" if mime.startswith("video") else "photo"
     else:
-        await message.answer("Rasm, video yoki https havola yuboring")
+        await message.answer("Video fayl yuboring")
         return
     try:
         buffer = await bot.download(file_id)
         media_url = await store.upload_media(buffer.read(), filename, mime)
     except Exception as exc:
         logger.exception("Media yuklanmadi")
-        await message.answer(f"Fayl yuklanmadi: {exc}\nQayta yuboring yoki havola yozing")
+        await message.answer(f"Fayl yuklanmadi: {exc}\nVideoni qayta yuboring")
         return
     data = state["data"]
-    data["media"] = media_url
     wizards.pop(message.from_user.id, None)
-    parsed = store.parse_catalog_line(
-        f"{data['title']} | {data['category']} | {data['demo']} | {media_url}"
-    )
-    if isinstance(parsed, str):
-        await message.answer(parsed)
-        return
-    if media_type == "video":
-        parsed["kind"] = "video"
-        parsed["video_url"] = media_url
-        parsed["preview_url"] = None
-        parsed["media_type"] = "video"
-    await save_catalog(message, parsed)
+    if data.get("kind") == "video":
+        media_type = "video"
+    await save_catalog(message, store.sample_payload(data, media_url, media_type))
     await message.answer("Menyu", reply_markup=admin_menu_kb(message.from_user.id))
 
 
@@ -350,14 +398,19 @@ async def send_template_list(message: Message) -> None:
         await message.answer(f"Ro'yxat olinmadi: {exc}")
         return
     if not items:
-        await message.answer("Aktiv shablon yo'q")
+        await message.answer("Aktiv namuna yo'q")
         return
     lines = []
     for index, item in enumerate(items, 1):
-        demo = escape(item.get("demo_url") or item.get("url") or "—")
+        kind = store.KIND_LABELS.get(item.get("kind"), item.get("kind") or "—")
+        if item.get("kind") == "video":
+            link = "video fayl"
+        else:
+            link = escape(item.get("demo_url") or item.get("url") or "—")
         lines.append(
-            f"{index}. <b>{escape(item['title'])}</b> — {escape(item.get('category') or item.get('kind') or '—')}\n"
-            f"ID: {item['id']}\n{demo}"
+            f"{index}. <b>{escape(item['title'])}</b> — {escape(kind)}"
+            f" / {escape(item.get('category') or '—')}\n"
+            f"ID: {item['id']}\n{link}"
         )
     await message.answer("\n\n".join(lines), parse_mode="HTML")
 
@@ -394,10 +447,8 @@ async def admin_list_templates(message: Message) -> None:
     items = await store.list_templates()
     if not items:
         await message.answer(
-            "Hali shablon yo'q\n\n"
-            "Qo'shish: rasm yoki video yuboring, caption:\n"
-            "#shablon Nom | https://havola | sayt\n"
-            "Turi: video, sayt yoki rasm (havola ixtiyoriy)"
+            "Hali namuna yo'q\n\n"
+            "Menyudan «Namuna qo'shish» ni bosing va Video yoki Veb-saytni tanlang"
         )
         return
     lines = [
@@ -448,8 +499,21 @@ async def admin_add_template_media(message: Message) -> None:
             await message.answer(f"Faylni Supabase'ga yuklab bo'lmadi: {exc}\n(Bot orqali maksimal 20 MB)")
             return
 
+    if kind == "video" and media_type != "video":
+        await message.answer("Video namunani fayl qilib yuboring. Havola saqlanmaydi")
+        return
+
     try:
-        item = await store.add_template(title=title, kind=kind, url=url, media_url=media_url, media_type=media_type)
+        item = await store.add_template(
+            title=title,
+            kind=kind,
+            url=media_url if kind == "video" else url,
+            media_url=media_url,
+            media_type=media_type,
+            demo_url=url if kind == "sayt" else None,
+            video_url=media_url if kind == "video" else None,
+            preview_url=media_url if kind != "video" else None,
+        )
     except Exception as exc:
         logger.exception("Shablon saqlanmadi")
         await message.answer(f"Shablon saqlanmadi: {exc}")
@@ -464,8 +528,17 @@ async def admin_add_template_text(message: Message) -> None:
         await message.answer("Format: #shablon Nom | https://havola | sayt")
         return
     title, url, kind = spec
+    if kind == "video":
+        await message.answer("Video namunani fayl qilib yuboring, caption: #shablon Nom | video")
+        return
     try:
-        item = await store.add_template(title=title, kind=kind, url=url)
+        item = await store.add_template(
+            title=title,
+            kind=kind,
+            url=url,
+            demo_url=url if kind == "sayt" else None,
+            video_url=url if kind == "video" else None,
+        )
     except Exception as exc:
         logger.exception("Shablon saqlanmadi")
         await message.answer(f"Shablon saqlanmadi: {exc}")
@@ -483,12 +556,25 @@ async def admin_buttons(callback: CallbackQuery) -> None:
     kind = action[1]
     await callback.answer()
 
+    if kind == "stats":
+        await send_stats(callback.message, user.id)
+        return
     if kind == "menu":
         wizards.pop(user.id, None)
         await callback.message.answer("Admin panel. Tugmani tanlang.", reply_markup=admin_menu_kb(user.id))
         return
     if kind == "add":
-        wizards[user.id] = {"step": "title", "data": {}, "mode": "template"}
+        wizards[user.id] = {"step": "kind", "data": {}, "mode": "template"}
+        await callback.message.answer("Namuna qanday bo'ladi?", reply_markup=format_kb())
+        return
+    if kind == "kind":
+        state = wizards.get(user.id)
+        chosen = action[2] if len(action) > 2 else ""
+        if not state or state.get("step") != "kind" or chosen not in ("video", "sayt"):
+            await callback.message.answer("Avval «Namuna qo'shish» ni bosing", reply_markup=admin_menu_kb(user.id))
+            return
+        state["data"]["kind"] = chosen
+        state["step"] = "title"
         await callback.message.answer(WIZARD_PROMPTS["title"])
         return
     if kind == "cat":
@@ -497,8 +583,12 @@ async def admin_buttons(callback: CallbackQuery) -> None:
             await callback.message.answer("Avval shablon qo'shishni boshlang", reply_markup=admin_menu_kb(user.id))
             return
         state["data"]["category"] = action[2]
-        state["step"] = "demo"
-        await callback.message.answer(WIZARD_PROMPTS["demo"])
+        if state["data"].get("kind") == "video":
+            state["step"] = "media"
+            await callback.message.answer(WIZARD_PROMPTS["media"])
+        else:
+            state["step"] = "demo"
+            await callback.message.answer(WIZARD_PROMPTS["demo"])
         return
     if kind == "list":
         await send_template_list(callback.message)
@@ -507,17 +597,18 @@ async def admin_buttons(callback: CallbackQuery) -> None:
     if kind == "toggles":
         items = await store.list_templates(active_only=False)
         if not items:
-            await callback.message.answer("Shablon yo'q", reply_markup=admin_menu_kb(user.id))
+            await callback.message.answer("Namuna yo'q", reply_markup=admin_menu_kb(user.id))
             return
         rows = []
         for item in items[:20]:
             mark = "yoniq" if item.get("is_active") else "o'chiq"
+            label = "VD" if item.get("kind") == "video" else "Sayt" if item.get("kind") == "sayt" else "Rasm"
             rows.append([InlineKeyboardButton(
-                text=f"{mark}: {item['title'][:28]}",
+                text=f"{mark} {label}: {item['title'][:22]}",
                 callback_data=f"adm:toggle:{item['id']}",
             )])
         rows.append([InlineKeyboardButton(text="Menyu", callback_data="adm:menu")])
-        await callback.message.answer("Shablonni bosing", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await callback.message.answer("Namunani bosing", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
         return
     if kind == "toggle":
         item = await store.toggle_template(action[2])
@@ -575,6 +666,7 @@ async def receipt_handler(message: Message) -> None:
     if agent.awaiting_receipt.get(key):
         agent.awaiting_receipt[key] = False
         agent.add_event(key, "Mijoz chek yubordi")
+        await store.mark_paid(message.from_user.id)
         await message.answer("Chekni oldim hozir ko'rib chiqamiz")
         await notify_admin(message.chat.id, "🧾 Mijoz chek yubordi", user=message.from_user)
         if ADMIN_ID:
