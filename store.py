@@ -264,6 +264,40 @@ async def download_media(url: str) -> tuple[bytes, str]:
     return r.content, file_name_from_url(url, default)
 
 
+def _error_detail(response: httpx.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text.strip() or response.reason_phrase
+    return body.get("message") or body.get("hint") or response.text.strip() or response.reason_phrase
+
+
+def _check(response: httpx.Response) -> None:
+    if response.is_success:
+        return
+    detail = _error_detail(response)
+    raise httpx.HTTPStatusError(
+        f"{response.status_code}: {detail}",
+        request=response.request,
+        response=response,
+    )
+
+
+async def _writable_columns() -> set[str]:
+    """Jadvaldagi haqiqiy ustunlar. Yo'q ustun yuborilsa Supabase 400 qaytaradi."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{TABLE}",
+            params={"select": "*", "limit": "1"},
+            headers=_headers(),
+        )
+        _check(r)
+        rows = r.json()
+    found = set(rows[0]) if rows else set()
+    found -= {"id", "created_at"}
+    return found or {"title", "kind", "url", "media_url", "media_type", "is_active"}
+
+
 async def add_template(
     title: str,
     kind: str,
@@ -286,14 +320,15 @@ async def add_template(
         "preview_url": preview_url,
         "video_url": video_url,
     }
-    payload = {k: v for k, v in payload.items() if v is not None}
+    allowed = await _writable_columns()
+    payload = {k: v for k, v in payload.items() if v is not None and k in allowed}
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
             f"{SUPABASE_URL}/rest/v1/{TABLE}",
             json=payload,
             headers=_headers({"Prefer": "return=representation"}),
         )
-        r.raise_for_status()
+        _check(r)
         return r.json()[0]
 
 
